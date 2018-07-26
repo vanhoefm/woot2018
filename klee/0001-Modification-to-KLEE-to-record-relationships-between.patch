@@ -1,0 +1,285 @@
+From 34f6074e4357b8119ea803ce6c0be98b31e1fa60 Mon Sep 17 00:00:00 2001
+From: Mathy Vanhoef <Mathy.Vanhoef@cs.kuleuven.be>
+Date: Sat, 16 Dec 2017 03:55:03 +0100
+Subject: [PATCH] Modification to KLEE to record relationships between symbolic
+ variables
+
+We tested this on KLEE commit 89c642abd24e47e5c3885ed704bed9aa8502c632
+
+---
+ include/klee/ExecutionState.h       | 15 ++++++++
+ include/klee/klee.h                 |  2 ++
+ lib/Core/ExecutionState.cpp         | 25 ++++++++++++++
+ lib/Core/SpecialFunctionHandler.cpp | 69 +++++++++++++++++++++++++++++++++++++
+ lib/Core/SpecialFunctionHandler.h   |  4 ++-
+ runtime/Runtest/intrinsics.c        |  4 +++
+ tools/klee/main.cpp                 | 13 +++++++
+ 7 files changed, 131 insertions(+), 1 deletion(-)
+
+diff --git a/include/klee/ExecutionState.h b/include/klee/ExecutionState.h
+index 6aec61e..69487b0 100644
+--- a/include/klee/ExecutionState.h
++++ b/include/klee/ExecutionState.h
+@@ -62,6 +62,16 @@ struct StackFrame {
+   ~StackFrame();
+ };
+ 
++class ObjectRelation {
++public:
++  std::string name;
++  std::vector<ref<Expr> > left;
++  std::vector<ref<Expr> > right;
++  ObjectRelation(std::string &name, std::vector<ref<Expr> > &left, std::vector<ref<Expr> > &right) :
++    name(name), left(left), right(right)
++  {}
++};
++
+ /// @brief ExecutionState representing a path under exploration
+ class ExecutionState {
+ public:
+@@ -139,6 +149,9 @@ public:
+   // FIXME: Move to a shared list structure (not critical).
+   std::vector<std::pair<const MemoryObject *, const Array *> > symbolics;
+ 
++  // List representing relationships between objects
++  std::vector<ObjectRelation*> objectRelations;
++
+   /// @brief Set of used array names for this state.  Used to avoid collisions.
+   std::set<std::string> arrayNames;
+ 
+@@ -173,6 +186,8 @@ public:
+ 
+   bool merge(const ExecutionState &b);
+   void dumpStack(llvm::raw_ostream &out) const;
++
++  void print_objects_relations(std::string &res) const;
+ };
+ }
+ 
+diff --git a/include/klee/klee.h b/include/klee/klee.h
+index 644c498..38bb271 100644
+--- a/include/klee/klee.h
++++ b/include/klee/klee.h
+@@ -36,6 +36,8 @@ extern "C" {
+    */
+   void klee_make_symbolic(void *addr, size_t nbytes, const char *name);
+ 
++  void klee_record_relation(const void *left, size_t left_size, const void *right, size_t right_size, const char *name);
++
+   /* klee_range - Construct a symbolic value in the signed interval
+    * [begin,end).
+    *
+diff --git a/lib/Core/ExecutionState.cpp b/lib/Core/ExecutionState.cpp
+index 522bdd1..d4675b4 100644
+--- a/lib/Core/ExecutionState.cpp
++++ b/lib/Core/ExecutionState.cpp
+@@ -116,6 +116,7 @@ ExecutionState::ExecutionState(const ExecutionState& state):
+     coveredLines(state.coveredLines),
+     ptreeNode(state.ptreeNode),
+     symbolics(state.symbolics),
++    objectRelations(state.objectRelations),
+     arrayNames(state.arrayNames),
+     openMergeStack(state.openMergeStack)
+ {
+@@ -378,3 +379,27 @@ void ExecutionState::dumpStack(llvm::raw_ostream &out) const {
+     target = sf.caller;
+   }
+ }
++
++void ExecutionState::print_objects_relations(std::string &res) const {
++  llvm::raw_string_ostream stream(res);
++
++  for (std::vector<ObjectRelation*>::const_iterator relship = objectRelations.begin(); relship != objectRelations.end(); ++relship) {
++    ObjectRelation *relation = *relship;
++
++    stream << relation->name << " left\n";
++    for (std::vector<ref<Expr> >::const_iterator it = relation->left.begin(); it != relation->left.end(); ++it) {
++      stream << "\t";
++      (*it)->print(stream);
++      stream << "\n";
++    }
++
++    stream << relation->name << " right\n";
++    for (std::vector<ref<Expr> >::const_iterator it = relation->right.begin(); it != relation->right.end(); ++it) {
++      stream << "\t";
++      (*it)->print(stream);
++      stream << "\n";
++    }
++
++    stream << "\n";
++  }
++}
+diff --git a/lib/Core/SpecialFunctionHandler.cpp b/lib/Core/SpecialFunctionHandler.cpp
+index a8d6ede..0251daf 100644
+--- a/lib/Core/SpecialFunctionHandler.cpp
++++ b/lib/Core/SpecialFunctionHandler.cpp
+@@ -30,6 +30,7 @@
+ 
+ #include <errno.h>
+ #include <sstream>
++#include <iostream>
+ 
+ using namespace llvm;
+ using namespace klee;
+@@ -93,6 +94,7 @@ static SpecialFunctionHandler::HandlerInfo handlerInfo[] = {
+   add("klee_get_errno", handleGetErrno, true),
+   add("klee_is_symbolic", handleIsSymbolic, true),
+   add("klee_make_symbolic", handleMakeSymbolic, false),
++  add("klee_record_relation", handleRecordRelation, false),
+   add("klee_mark_global", handleMarkGlobal, false),
+   add("klee_open_merge", handleOpenMerge, false),
+   add("klee_close_merge", handleCloseMerge, false),
+@@ -778,6 +780,73 @@ void SpecialFunctionHandler::handleMarkGlobal(ExecutionState &state,
+   }
+ }
+ 
++void SpecialFunctionHandler::extract_expressions(ExecutionState &state, ref<Expr> &pointer, ref<Expr> &size, std::vector<ref<Expr> > &expressions)
++{
++  ObjectPair object;
++  if (!state.addressSpace.resolveOne(cast<ConstantExpr>(pointer), object))
++    assert(0 && "XXX out of bounds / multiple resolution unhandled");
++
++  ref<Expr> offsetExpr = object.first->getOffsetExpr(pointer);
++  unsigned int offset =  cast<ConstantExpr>(offsetExpr)->getZExtValue();
++  unsigned int len = cast<ConstantExpr>(size)->getZExtValue();
++
++  assert(offset + len <= object.second->size && "input length is out of range");
++
++  for (unsigned int i = 0; i < len; ++i)
++    expressions.push_back(object.second->read8(offset + i));
++}
++
++void SpecialFunctionHandler::handleRecordRelation(ExecutionState &state,
++                                               KInstruction *target,
++                                               std::vector<ref<Expr> > &arguments) {
++  // Sanity check arguments
++  if (arguments.size() != 5) {
++    executor.terminateStateOnError(state, "illegal number of arguments to klee_record_relation", Executor::User);
++    return;
++  }
++  std::string name = readStringAtAddress(state, arguments[4]);
++
++  if (!isa<ConstantExpr>(arguments[0])) {
++    executor.terminateStateOnError(state, "klee_record_relation doesn't support symbolic left pointer (at " + name + ")",
++                                   Executor::User);
++    return;
++  }
++  // TODO: We need to support symbolic left sizes
++  if (!isa<ConstantExpr>(arguments[1])) {
++    executor.terminateStateOnError(state, "klee_record_relation doesn't support symbolic left size (at " + name + ")",
++                                   Executor::User);
++    return;
++  }
++  if (!isa<ConstantExpr>(arguments[2])) {
++    executor.terminateStateOnError(state, "klee_record_relation doesn't support symbolic right pointer (at " + name + ")",
++                                   Executor::User);
++    return;
++  }
++  if (!isa<ConstantExpr>(arguments[3])) {
++    executor.terminateStateOnError(state, "klee_record_relation doesn't support symbolic right size (at " + name + ")",
++                                   Executor::User);
++    return;
++  }
++
++  // If any of the lengths are zero, there is nothing to do
++  if (cast<ConstantExpr>(arguments[1])->getZExtValue() == 0 || cast<ConstantExpr>(arguments[3])->getZExtValue() == 0)
++    return;
++
++  // Record the relation between both (symbolic) variables
++  std::vector<ref<Expr> > left;
++  std::vector<ref<Expr> > right;
++
++  extract_expressions(state, arguments[0], arguments[1], left);
++  extract_expressions(state, arguments[2], arguments[3], right);
++
++  if (name.length() == 0) {
++    name = "unnamed";
++    klee_warning("klee_record_relation: renamed empty name to \"unnamed\"");
++  }
++
++  state.objectRelations.push_back(new ObjectRelation(name, left, right));
++}
++
+ void SpecialFunctionHandler::handleAddOverflow(ExecutionState &state,
+                                                KInstruction *target,
+                                                std::vector<ref<Expr> > &arguments) {
+diff --git a/lib/Core/SpecialFunctionHandler.h b/lib/Core/SpecialFunctionHandler.h
+index 7e58018..2ff2963 100644
+--- a/lib/Core/SpecialFunctionHandler.h
++++ b/lib/Core/SpecialFunctionHandler.h
+@@ -91,7 +91,8 @@ namespace klee {
+     /* Convenience routines */
+ 
+     std::string readStringAtAddress(ExecutionState &state, ref<Expr> address);
+-    
++    void extract_expressions(ExecutionState &state, ref<Expr> &pointer, ref<Expr> &size, std::vector<ref<Expr> > &expressions);
++
+     /* Handlers */
+ 
+ #define HANDLER(name) void name(ExecutionState &state, \
+@@ -114,6 +115,7 @@ namespace klee {
+     HANDLER(handleGetValue);
+     HANDLER(handleIsSymbolic);
+     HANDLER(handleMakeSymbolic);
++    HANDLER(handleRecordRelation);
+     HANDLER(handleMalloc);
+     HANDLER(handleMarkGlobal);
+     HANDLER(handleOpenMerge);
+diff --git a/runtime/Runtest/intrinsics.c b/runtime/Runtest/intrinsics.c
+index 4d785ee..03aacb9 100644
+--- a/runtime/Runtest/intrinsics.c
++++ b/runtime/Runtest/intrinsics.c
+@@ -130,6 +130,10 @@ void klee_make_symbolic(void *array, size_t nbytes, const char *name) {
+   }
+ }
+ 
++void klee_record_relation(const void *left, size_t left_size, const void *right, size_t right_size, const char *name) {
++	// Do nothing for now
++}
++
+ void klee_silent_exit(int x) {
+   exit(x);
+ }
+diff --git a/tools/klee/main.cpp b/tools/klee/main.cpp
+index 2b2fe3e..3f4805d 100644
+--- a/tools/klee/main.cpp
++++ b/tools/klee/main.cpp
+@@ -56,6 +56,8 @@
+ #include <iterator>
+ #include <sstream>
+ 
++#include <iostream>
++
+ 
+ using namespace llvm;
+ using namespace klee;
+@@ -457,8 +459,18 @@ void KleeHandler::processTestCase(const ExecutionState &state,
+       delete f;
+     }
+ 
++    /* FIXME add new parameter */
++    if (true) {
++      std::string hash_relations;
++      state.print_objects_relations(hash_relations);
++      llvm::raw_ostream *f = openTestFile("relations", id);
++      *f << hash_relations;
++      delete f;
++    }
++
+     if (errorMessage || WriteKQueries) {
+       std::string constraints;
++      std::cout << "writing constraints" << std::endl;
+       m_interpreter->getConstraintLog(state, constraints,Interpreter::KQUERY);
+       llvm::raw_ostream *f = openTestFile("kquery", id);
+       *f << constraints;
+@@ -717,6 +729,7 @@ static const char *modelledExternals[] = {
+   "klee_get_obj_size",
+   "klee_is_symbolic",
+   "klee_make_symbolic",
++  "klee_record_relation",
+   "klee_mark_global",
+   "klee_open_merge",
+   "klee_close_merge",
+-- 
+1.9.1
+

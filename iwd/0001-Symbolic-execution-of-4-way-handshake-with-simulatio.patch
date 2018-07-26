@@ -1,0 +1,623 @@
+From 93935e06edd8dedffefaff1a8758e755be3fdb89 Mon Sep 17 00:00:00 2001
+From: Mathy Vanhoef <Mathy.Vanhoef@cs.kuleuven.be>
+Date: Thu, 24 May 2018 01:17:41 +0200
+Subject: [PATCH] Symbolic execution of 4-way handshake with simulation of
+ cryptographic primitives
+
+Test was tested on top of iwd commit 9556e0be9f8ce152810d6844b6f4e0fda5b802a7.
+
+---
+ .gitignore         |   1 +
+ Makefile.am        |  20 ++++++-
+ build.sh           |   9 ++++
+ src/eapol.c        |  19 ++++++-
+ src/klee-util.c    | 112 +++++++++++++++++++++++++++++++++++++++
+ src/klee-util.h    |  18 +++++++
+ src/run-klee.sh    |   4 ++
+ src/symex.c        | 152 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/symex_crypto.c | 149 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 9 files changed, 481 insertions(+), 3 deletions(-)
+ create mode 100755 build.sh
+ create mode 100644 src/klee-util.c
+ create mode 100644 src/klee-util.h
+ create mode 100755 src/run-klee.sh
+ create mode 100644 src/symex.c
+ create mode 100644 src/symex_crypto.c
+
+diff --git a/.gitignore b/.gitignore
+index 98528f8..ddc9389 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,6 +1,7 @@
+ *.o
+ *.lo
+ *.la
++*.bc
+ .libs
+ .deps
+ .dirstamp
+diff --git a/Makefile.am b/Makefile.am
+index a0180bc..8b03a5c 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -1,4 +1,3 @@
+-
+ AM_MAKEFLAGS = --no-print-directory
+ 
+ ACLOCAL_AMFLAGS = -I build-aux
+@@ -67,7 +66,7 @@ ell_sources = ell/ell.h ell/private.h ell/missing.h \
+ 
+ ell_libell_internal_la_SOURCES = $(ell_sources)
+ 
+-bin_PROGRAMS =
++bin_PROGRAMS = src/symex
+ 
+ libexec_PROGRAMS = src/iwd
+ 
+@@ -121,6 +120,23 @@ systemd_unitdir = @SYSTEMD_UNITDIR@
+ systemd_unit_DATA = src/iwd.service
+ endif
+ 
++# This is based on test_eapol
++src_symex_SOURCES = src/symex.c	\
++					src/symex_crypto.c \
++					src/klee-util.c src/klee-util.h \
++					src/eapol.h src/eapol.c \
++					src/handshake.h src/handshake.c \
++					src/ie.h src/ie.c \
++					src/eap.h src/eap.c \
++					src/watchlist.h src/watchlist.c \
++					src/eap-md5.c
++
++src_symex_CPPFLAGS = -DMODELTESTING
++
++src_symex_LDADD = ell/libell-internal.la -ldl -lkleeRuntest
++
++src_symex_DEPENDENCIES = ell/libell-internal.la
++
+ if CLIENT
+ bin_PROGRAMS += client/iwctl
+ 
+diff --git a/build.sh b/build.sh
+new file mode 100755
+index 0000000..e1250c5
+--- /dev/null
++++ b/build.sh
+@@ -0,0 +1,9 @@
++#!/bin/bash
++set -e
++
++source ../venv2/bin/activate
++export LLVM_COMPILER=clang
++./bootstrap
++./configure CC=wllvm
++make
++
+diff --git a/src/eapol.c b/src/eapol.c
+index fefb3fd..87f86ad 100644
+--- a/src/eapol.c
++++ b/src/eapol.c
+@@ -84,6 +84,7 @@ bool eapol_calculate_mic(const uint8_t *kck, const struct eapol_key *frame,
+ 	}
+ }
+ 
++#ifndef MODELTESTING
+ bool eapol_verify_mic(const uint8_t *kck, const struct eapol_key *frame)
+ {
+ 	size_t frame_len = sizeof(struct eapol_key);
+@@ -129,6 +130,7 @@ bool eapol_verify_mic(const uint8_t *kck, const struct eapol_key *frame)
+ 
+ 	return false;
+ }
++#endif
+ 
+ uint8_t *eapol_decrypt_key_data(const uint8_t *kek,
+ 				const struct eapol_key *frame,
+@@ -151,6 +153,9 @@ uint8_t *eapol_decrypt_key_data(const uint8_t *kek,
+ 		return NULL;
+ 	};
+ 
++#ifdef MODELTESTING
++	klee_assume(expected_len < (1 << 16));
++#endif
+ 	buf = l_new(uint8_t, expected_len);
+ 
+ 	switch (frame->key_descriptor_version) {
+@@ -1022,7 +1027,11 @@ static void eapol_handle_ptk_3_of_4(struct eapol_sm *sm,
+ 	 * or if the ANonce value in message 3 differs from the ANonce value
+ 	 * in message 1."
+ 	 */
++#ifdef MODELTESTING
++	if (klee_memcmp_const(sm->handshake->anonce, ek->key_nonce, sizeof(ek->key_nonce)))
++#else
+ 	if (memcmp(sm->handshake->anonce, ek->key_nonce, sizeof(ek->key_nonce)))
++#endif
+ 		return;
+ 
+ 	/*
+@@ -1425,8 +1434,16 @@ static void eapol_key_handle(struct eapol_sm *sm,
+ 						&key_data_len);
+ 		if (!decrypted_key_data)
+ 			return;
+-	} else
++
++#ifdef MODELTESTING
++		symex_constrain_ies(decrypted_key_data, key_data_len);
++#endif
++	} else {
+ 		key_data_len = L_BE16_TO_CPU(ek->key_data_len);
++#ifdef MODELTESTING
++		symex_constrain_ies(ek->key_data, key_data_len);
++#endif
++}
+ 
+ 	if (ek->key_type == 0) {
+ 		/* GTK handshake allowed only after PTK handshake complete */
+diff --git a/src/klee-util.c b/src/klee-util.c
+new file mode 100644
+index 0000000..f501915
+--- /dev/null
++++ b/src/klee-util.c
+@@ -0,0 +1,112 @@
++#include <stdlib.h>
++#include <string.h>
++
++#include "klee-util.h"
++
++
++void my_make_symbolic(void *memory, size_t len, const char *name)
++{
++	uint8_t *buffer = malloc(len);
++
++	klee_make_symbolic(buffer, len, name);
++	memcpy(memory, buffer, len);
++
++	free(buffer);
++}
++
++
++void klee_simulate_decryption(const uint8_t *ciphertext, size_t clen, uint8_t *decrypted, size_t plen, const char *suffix)
++{
++	const char *prefix = "decrypted_only-";
++	char *name = malloc(strlen(prefix) + strlen(suffix) + 1);
++	strcpy(name, prefix);
++	strcat(name, suffix);
++
++	uint8_t *buffer = malloc(plen);
++	klee_make_symbolic(buffer, plen, name);
++
++	// Record relation before memory to support cases where ciphertext and decrypted are the same buffer
++	klee_record_relation(ciphertext, clen, buffer, plen, name);
++
++	memcpy(decrypted, buffer, plen);
++
++	free(buffer);
++	free(name);
++}
++
++void klee_simulate_authenticted_decryption(const uint8_t *ciphertext, size_t clen, uint8_t *decrypted, size_t plen, const char *suffix)
++{
++	const char *prefix = "decrypted_aead-";
++	char *name = malloc(strlen(prefix) + strlen(suffix) + 1);
++	strcpy(name, prefix);
++	strcat(name, suffix);
++
++	uint8_t *buffer = malloc(plen);
++	klee_make_symbolic(buffer, plen, name);
++
++	// Record relation before memory to support cases where ciphertext and decrypted are the same buffer
++	klee_record_relation(ciphertext, clen, buffer, plen, name);
++
++	memcpy(decrypted, buffer, plen);
++
++	free(buffer);
++	free(name);
++
++	// TODO: We should fork and also have cases where decryption fails to see what happens then!
++	// return true or false
++}
++
++void klee_simulate_mac(const uint8_t *input, size_t inlen, uint8_t *digest, size_t outlen, const char *suffix)
++{
++	const char *prefix = "digest-";
++	char *name = malloc(strlen(prefix) + strlen(suffix) + 1);
++	strcpy(name, prefix);
++	strcat(name, suffix);
++
++	uint8_t *buffer = malloc(outlen);
++	klee_make_symbolic(buffer, outlen, name);
++
++	// Record relation before memory to support cases where digest pointer lies within input
++	klee_record_relation(input, inlen, buffer, outlen, name);
++
++	memcpy(digest, buffer, outlen);
++
++	free(buffer);
++	free(name);
++}
++
++int klee_memcmp_const(const void *a, const void *b, size_t len)
++{
++	const uint8_t *aa = a;
++	const uint8_t *bb = b;
++	size_t i;
++	uint8_t res;
++
++	for (res = 0, i = 0; i < len; i++)
++		res |= aa[i] ^ bb[i];
++
++	return res;
++}
++
++void symex_constrain_ies(uint8_t *decrypted_key_data, size_t key_data_len)
++{
++	if (key_data_len >= 2) {
++		klee_assume(decrypted_key_data[0] == 0x30);
++		klee_assume(decrypted_key_data[1] == 0x12);
++
++		int pos = 2 + decrypted_key_data[1];
++
++//	static const unsigned char gtk_oui[] = { 0x00, 0x0f, 0xac, 0x01 };
++		klee_assume(decrypted_key_data[pos] == 221/*IE_TYPE_VENDOR_SPECIFIC*/);
++		klee_assume(decrypted_key_data[pos + 1] == 4 + 2 + 16);
++		klee_assume(decrypted_key_data[pos + 2] == 0x00);
++		klee_assume(decrypted_key_data[pos + 3] == 0x0f);
++		klee_assume(decrypted_key_data[pos + 4] == 0xac);
++		klee_assume(decrypted_key_data[pos + 5] == 0x01);
++
++		pos += 2 + decrypted_key_data[pos + 1];
++		for (int i = pos; i < key_data_len; ++i)
++			decrypted_key_data[i] = 0;
++	}
++}
++
+diff --git a/src/klee-util.h b/src/klee-util.h
+new file mode 100644
+index 0000000..0a18a95
+--- /dev/null
++++ b/src/klee-util.h
+@@ -0,0 +1,18 @@
++#ifndef KLEE_UTIL_H
++#define KLEE_UTIL_H
++
++#include <klee/klee.h>
++#include <assert.h>
++
++void my_make_symbolic(void *memory, size_t len, const char *name);
++
++void klee_simulate_decryption(const uint8_t *ciphertext, size_t clen, uint8_t *decrypted, size_t plen, const char *suffix);
++void klee_simulate_authenticted_decryption(const uint8_t *ciphertext, size_t clen, uint8_t *decrypted, size_t plen, const char *suffix);
++void klee_simulate_mac(const uint8_t *input, size_t inlen, uint8_t *digest, size_t outlen, const char *suffix);
++
++int klee_memcmp_const(const void *a, const void *b, size_t len);
++
++// FIXME: More this function elsewhere
++void symex_constrain_ies(uint8_t *decrypted_key_data, size_t key_data_len);
++
++#endif // KLEE_UTIL_H
+diff --git a/src/run-klee.sh b/src/run-klee.sh
+new file mode 100755
+index 0000000..7da21e6
+--- /dev/null
++++ b/src/run-klee.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++source ../../venv2/bin/activate
++extract-bc symex
++klee --libc=uclibc --posix-runtime symex.bc
+diff --git a/src/symex.c b/src/symex.c
+new file mode 100644
+index 0000000..9ac81fe
+--- /dev/null
++++ b/src/symex.c
+@@ -0,0 +1,152 @@
++/**
++ * This is based on code from test-eapol.c to build a driver that is used
++ * to symbolically execute the 4-way handshake.
++ */
++#include <klee/klee.h>
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include <stdio.h>
++#include <string.h>
++#include <assert.h>
++#include <ell/ell.h>
++#include <linux/if_ether.h>
++
++#include "src/eapol.h"
++#include "src/ie.h"
++#include "src/eap.h"
++#include "src/handshake.h"
++
++static bool transmitted_frame = false;
++
++static int simulate_eapol_tx(uint32_t ifindex,
++			const uint8_t *aa_addr, uint16_t proto,
++			const struct eapol_frame *ef, bool noencrypt,
++			void *user_data)
++{
++	transmitted_frame = true;
++
++	printf("%s\n", __FUNCTION__);
++	return 0;
++}
++
++
++void build_rsne(uint8_t rsne_buf[256], bool is_rsn)
++{
++	struct ie_rsn_info info;
++
++	memset(&info, 0, sizeof(info));
++
++	info.akm_suites = IE_RSN_AKM_SUITE_PSK;
++	info.pairwise_ciphers = IE_RSN_CIPHER_SUITE_CCMP;
++	info.group_cipher = IE_RSN_CIPHER_SUITE_CCMP;
++	assert(info.akm_suites);
++	assert(info.pairwise_ciphers && info.group_cipher);
++
++	//info.group_management_cipher = IE_RSN_CIPHER_SUITE_BIP;
++	info.mfpc = false;
++	info.mfpr = false;
++	assert(!info.mfpc || info.group_management_cipher != 0);
++	assert(!info.mfpr || info.mfpc);
++
++	if (is_rsn)
++		ie_build_rsne(&info, rsne_buf);
++	else
++		ie_build_wpa(&info, rsne_buf);
++}
++
++
++static bool test_nonce(uint8_t nonce[])
++{
++	memset(nonce, 0x11, 32);
++
++	return true;
++}
++
++
++static bool deliver_symbolic_frame(const uint8_t *src, size_t key_data_len)
++{
++	size_t frame_len = sizeof(struct eapol_key) + key_data_len;
++	uint8_t *buffer = malloc(frame_len);
++
++	klee_make_symbolic(buffer, frame_len, "eapol_frame");
++
++	// Optionally guide the symbolic execution by setting certain fields
++	struct eapol_key *frame = (struct eapol_key*)buffer;
++	frame->header.packet_type = 3;
++	frame->header.packet_len =  L_CPU_TO_BE16(frame_len - sizeof(struct eapol_header));
++	frame->key_data_len = L_CPU_TO_BE16(key_data_len);
++
++	transmitted_frame = false;
++	__eapol_rx_packet(1, src, ETH_P_PAE, buffer, frame_len, false);
++	free(buffer);
++	return transmitted_frame;
++}
++
++
++static void eapol_sm_test_wpa_ptk_gtk(const void *data)
++{
++	const unsigned char psk[] = {
++		0xbf, 0x9a, 0xa3, 0x15, 0x53, 0x00, 0x12, 0x5e,
++		0x7a, 0x5e, 0xbb, 0x2a, 0x54, 0x9f, 0x8c, 0xd4,
++		0xed, 0xab, 0x8e, 0xe1, 0x2e, 0x94, 0xbf, 0xc2,
++		0x4b, 0x33, 0x57, 0xad, 0x04, 0x96, 0x65, 0xd9 };
++	static uint8_t ap_address[] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 };
++	static uint8_t sta_address[] = { 0x02, 0x00, 0x00, 0x00, 0x01, 0x00 };
++	const char *ssid = "simulated_ssid";
++	uint8_t own_wpa_ie[256], ap_wpa_ie[256];
++	bool r;
++	struct handshake_state *hs;
++	struct eapol_sm *sm;
++
++	eapol_init();
++	__handshake_set_get_nonce_func(test_nonce);
++
++	hs = handshake_state_new(1);
++	sm = eapol_sm_new(hs);
++	eapol_register(sm);
++
++	handshake_state_set_pmk(hs, psk, sizeof(psk));
++	handshake_state_set_authenticator_address(hs, ap_address);
++	handshake_state_set_supplicant_address(hs, sta_address);
++	handshake_state_set_ssid(hs, (void *) ssid, strlen(ssid));
++
++	build_rsne(own_wpa_ie, true);
++	r = handshake_state_set_own_rsn(hs, own_wpa_ie);
++	assert(r);
++
++	build_rsne(ap_wpa_ie, true);
++	handshake_state_set_ap_rsn(hs, ap_wpa_ie);
++	eapol_start(sm);
++
++	for (int i = 0; i < ap_wpa_ie[1] + 2; ++i)
++		printf("%02X ", ap_wpa_ie[i]);
++	printf("\n");
++
++	__eapol_set_tx_packet_func(simulate_eapol_tx);
++	//TODO: __eapol_set_deauthenticate_func
++
++	if (!deliver_symbolic_frame(ap_address, 0))
++		return;
++	// TODO: More dynamic lenghts?
++	if (!deliver_symbolic_frame(ap_address, 50))
++		return;
++	//if (!deliver_symbolic_frame(ap_address, sizeof(struct eapol_key)))
++	//	return;
++
++	printf("Processing frame done\n");
++
++	/** Don't cleanup sm because this might already have happened on failed frames */
++	//eapol_sm_free(sm);
++	//handshake_state_free(hs);
++	//eapol_exit();
++}
++
++
++int main(int argc, char *argv[])
++{
++	eapol_sm_test_wpa_ptk_gtk(NULL);
++}
++
+diff --git a/src/symex_crypto.c b/src/symex_crypto.c
+new file mode 100644
+index 0000000..140fb2f
+--- /dev/null
++++ b/src/symex_crypto.c
+@@ -0,0 +1,149 @@
++#include <stdio.h>
++#include <stdint.h>
++#include <stdbool.h>
++
++#include <ell/ell.h>
++
++#include "klee-util.h"
++#include "crypto.h"
++#include "eapol.h"
++
++/**
++ * HMACs. Currently we simply simulate the MAC and do not track secret keys.
++ */
++
++bool hmac_md5(const void *key, size_t key_len,
++		const void *data, size_t data_len, void *output, size_t size) {
++	klee_simulate_mac(data, data_len, output, size, "hmac_md5");
++	return true;
++}
++
++bool hmac_sha1(const void *key, size_t key_len,
++		const void *data, size_t data_len, void *output, size_t size) {
++	klee_simulate_mac(data, data_len, output, size, "hmac_sha1");
++	return true;
++}
++
++bool hmac_sha256(const void *key, size_t key_len,
++		const void *data, size_t data_len, void *output, size_t size) {
++	klee_simulate_mac(data, data_len, output, size, "hmac_sha256");
++	return true;
++}
++
++bool cmac_aes(const void *key, size_t key_len,
++		const void *data, size_t data_len, void *output, size_t size) {
++	klee_simulate_mac(data, data_len, output, size, "hmac_aes");
++	return true;
++}
++
++
++/**
++ * Decryption and encryption routines
++ */
++
++bool aes_unwrap(const uint8_t *kek, const uint8_t *in, size_t len,
++			uint8_t *out) {
++	klee_assume(len >= 8);
++	klee_simulate_authenticted_decryption(in, len, out, len - 8, "aes_unwrap");
++	return true;
++}
++
++bool aes_wrap(const uint8_t *kek, const uint8_t *in, size_t len, uint8_t *out) {
++	// FIXME: Simulate authenticated encryption
++	return true;
++}
++
++bool arc4_skip(const uint8_t *key, size_t key_len, size_t skip,
++		const uint8_t *in, size_t len, uint8_t *out) {
++	// FIXME: This is also used for encryption
++	if (len == 0)
++		return true;
++	klee_simulate_decryption(in, len, out, len, "rc4");
++	return true;
++}
++
++
++/**
++ * Key derivation and other utility functions specific to Wi-Fi
++ */
++
++int crypto_cipher_key_len(enum crypto_cipher cipher)
++{
++	switch (cipher) {
++	case CRYPTO_CIPHER_WEP40:
++		return 5;
++	case CRYPTO_CIPHER_WEP104:
++		return 13;
++	case CRYPTO_CIPHER_TKIP:
++		return 32;
++	case CRYPTO_CIPHER_CCMP:
++		return 16;
++	case CRYPTO_CIPHER_BIP:
++		return 16;
++	};
++
++	return 0;
++}
++
++bool crypto_derive_pmk_r0(const uint8_t *xxkey,
++				const uint8_t *ssid, size_t ssid_len,
++				uint16_t mdid,
++				const uint8_t *r0khid, size_t r0kh_len,
++				const uint8_t *s0khid, uint8_t *out_pmk_r0,
++				uint8_t *out_pmk_r0_name)
++{
++	// TODO
++	return true;
++}
++
++bool crypto_derive_pmk_r1(const uint8_t *pmk_r0,
++				const uint8_t *r1khid, const uint8_t *s1khid,
++				const uint8_t *pmk_r0_name,
++				uint8_t *out_pmk_r1,
++				uint8_t *out_pmk_r1_name)
++{
++	// TODO
++	return true;
++}
++
++bool crypto_derive_ft_ptk(const uint8_t *pmk_r1, const uint8_t *pmk_r1_name,
++				const uint8_t *addr1, const uint8_t *addr2,
++				const uint8_t *nonce1, const uint8_t *nonce2,
++				struct crypto_ptk *out_ptk, size_t ptk_len,
++				uint8_t *out_ptk_name)
++{
++	// TODO
++	return true;
++}
++
++bool crypto_derive_pairwise_ptk(const uint8_t *pmk,
++				const uint8_t *addr1, const uint8_t *addr2,
++				const uint8_t *nonce1, const uint8_t *nonce2,
++				struct crypto_ptk *out_ptk, size_t ptk_len,
++				bool use_sha256)
++{
++	// TODO
++	return true;
++}
++
++bool crypto_derive_pmkid(const uint8_t *pmk,
++				const uint8_t *addr1, const uint8_t *addr2,
++				uint8_t *out_pmkid, bool use_sha256)
++{
++	// TODO
++	return true;
++}
++
++bool eapol_verify_mic(const uint8_t *kck, const struct eapol_key *frame)
++{
++	size_t frame_len = sizeof(struct eapol_key) + L_BE16_TO_CPU(frame->key_data_len);
++	uint8_t mic_input[frame_len];
++	uint8_t mic[16];
++
++	memcpy(mic_input, frame, frame_len);
++	memset(mic_input + offsetof(struct eapol_key, key_mic_data), 0, 16);
++
++	klee_simulate_mac(mic_input, frame_len, mic, 16, "eapol_verify_mic");
++	return !!klee_memcmp_const(frame->key_mic_data, mic, 16);
++}
++
+-- 
+1.9.1
+
